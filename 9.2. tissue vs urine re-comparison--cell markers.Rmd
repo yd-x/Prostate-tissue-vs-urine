@@ -1,0 +1,610 @@
+---
+title: "9.2. tissue vs urine re-comparison--cell markers"
+author: "YD-X"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document: 
+    toc: true
+    number_sections: true
+    latex_engine: xelatex
+  html_document: 
+    toc: true
+    number_sections: true
+---
+
+This rmd file is to compare the enrichment of cell markers between tissue vs urine samples. The cell markers are downloaded from the public databases [CellMarker 2.0](http://www.bio-bigdata.center/index.html) and [PanglaoDB](https://panglaodb.se/index.html).
+
+# Preparation
+
+```{r message=FALSE, warning=FALSE}
+library(magrittr)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(stringr)
+library(reshape2)
+library(rstatix)
+library(openxlsx)
+library(GSVA)
+library(biomaRt)
+```
+
+```{r}
+setwd("E:/study/Queens/OneDrive - Queen's University/project codes and results/9. tissue vs urine re-comparison")
+```
+
+```{r}
+load("9.2. tissue vs urine re-comparison--cell markers.RData")
+```
+
+# Load data
+
+```{r}
+load("9.1. tissue vs urine re-comparison--ES and MSigDB.RData")
+
+rm(list = ls(all.names = T)[
+  !ls(all.names = T) %in% 
+    c("ensembl","gene.id","sample.info","mtu.sample",
+      "GSVA.expset","exp.proc.mtu","exp.proc.mtu.long",
+      "exp.mtu.rep_comb","exp.mtu.rep_comb.long","list.293",
+      "GSVA.anno.sam","exp.ori.sample_row",
+      "exp.ori.sample_col")])
+```
+
+# CellMarker (Harbin Medical University)
+
+## Load and curate cell marker gene sets
+
+cell marker gene sets
+
+```{r}
+cellmarker.raw <- 
+  read.xlsx("data/Harbin Med Univ CellMarker 2.0 cell markers.xlsx")
+
+# Extract only specific columns
+cellmarker.curated <- 
+  cellmarker.raw %>% 
+  dplyr::select(
+    c(tissue_class,tissue_type,
+      cancer_type,cell_type,cell_name,
+      marker,Symbol,GeneID,Genetype,Genename)) %>% 
+  ## Integrate tissue class and type for filtration.
+  ## Also integrate tissue class, type and cell name for 
+  ## identifying same cells from different organs.
+  dplyr::mutate(
+    class_type = paste0(tissue_class,"_",tissue_type),
+    full.name = paste0(class_type,"_",cell_name))
+```
+
+Filter tissue types based on the location. The filtration results are recorded in a separate xlsx file.
+
+```{r eval=FALSE}
+# Summarize all organs and write into an xlsx file.
+#
+# write.xlsx(
+#   cellmarker.curated[c("tissue_class","tissue_type","class_type")] %>%
+#     unique %>%
+#     data.frame(),
+#   file = "data/organs.xlsx",
+#   overwrite = T)
+
+# Load filtration results
+cellmarker.organ.filt <- 
+  read.xlsx(
+    xlsxFile = "data/cell marker organ filtration.xlsx") %>% 
+  dplyr::filter(!is.na(keep))
+
+# filter cell markers
+cellmarker.curated %<>% 
+  dplyr::filter(
+    class_type %in% cellmarker.organ.filt$class_type)
+
+cellmarker.organ.filt$class_type
+```
+
+FIlter cancer types. Include only normal and prostate cancer cells.
+
+```{r}
+cellmarker.curated %<>% 
+  dplyr::filter(
+    cancer_type %in% 
+      c("Normal","Prostate Cancer (circulating)",
+        "Prostate Cancer","Undefined",
+        "Urothelial carcinoma",
+        "Neuroendocrine prostate cancer",
+        "Castration-resistant prostate cancer",
+        "Prostate cancer"))
+```
+
+Check if our genes are in the cell marker gene sets
+
+```{r}
+gene.list.exp <- 
+  data.frame(
+    Gene = rownames(GSVA.expset)) %>% 
+  dplyr::mutate(
+    ID = gene.id$ID[
+      match(Gene,gene.id$Gene)])
+
+table(gene.list.exp$ID %in% cellmarker.curated$GeneID)
+```
+
+There are 77 genes in the marker gene sets and 290 genes not in the gene sets
+
+Check if there are genes that do not match the symbol in the gene sets in the included genes.
+
+```{r}
+gene.list.exp[
+  gene.list.exp$ID %in% cellmarker.curated$GeneID &
+    !gene.list.exp$Gene %in% cellmarker.curated$Symbol,]
+```
+
+There are three genes that do not match the symbols in the gene sets.
+
+-   ID: 5170. In the expression data: PDPK1. In the gene sets: PDK1. PDK1 is an alias of PDPK1. Keep both terms.
+
+-   ID: 5743. In the expression data: PTGS2. In the gene sets: COX2. COX2 is an alias of PTGS2. Keep both terms.
+
+-   ID: 23428. In the expression data: SLC7A8. In the gene sets: LAT2. LAT2 is an alias of SLC7A8. Keep both terms.
+
+-   ID: 25840. In the expression data: TMT1A. In the gene sets: METTL7A. METTL7A is is an alias of TMT1A. Keep both terms.
+
+Because there are multiple gene symbols matching one ID in the cell marker set, we transform gene symbols into IDs in the expression set and use IDs for GSVA.
+
+## Organize GSVA input.
+
+```{r}
+# Gene set
+GSVA.geneset.cellmarker <- 
+  cellmarker.curated %>% 
+  # Split the genes into a gene set list
+  split(x = .$GeneID,
+        f = .$full.name) %>% 
+  # Remove duplicate genes
+  lapply(unique)
+
+# Expression set. Transform symbols to IDs.
+rownames(GSVA.expset) <- 
+  gene.id$ID[
+    match(rownames(GSVA.expset),gene.id$Gene)]
+```
+
+## Perform GSVA
+
+```{r}
+overlap.gene.num <- 3
+
+GSVA.result.cellmarker.all_sam <- 
+  gsvaParam(
+    exprData = GSVA.expset,
+    geneSets = GSVA.geneset.cellmarker,
+    kcdf = "none",
+    maxDiff = T,
+    absRanking = T,
+    minSize = overlap.gene.num) %>%
+  gsva(verbose = T) %>% 
+  data.frame(check.names = F)
+```
+
+Generate a long version
+
+```{r}
+# Add a cell marker column
+GSVA.result.cellmarker.all_sam %<>% 
+  dplyr::mutate(
+    cell.type = rownames(.))
+
+# Generate a long version
+GSVA.result.cellmarker.all_sam.long <- 
+  GSVA.result.cellmarker.all_sam %>% 
+  reshape2::melt(
+    id.vars = "cell.type",
+    variable.name = "sample.id",
+    value.name = "enrichment.score") %>% 
+  ## Add sample type annotations
+  dplyr::mutate(
+    sample.type =
+      GSVA.anno.sam$`sample type`[
+        match(.$sample.id,
+              rownames(GSVA.anno.sam))])
+```
+
+### MTU sample results
+
+Combine replicates by averaging each gene set so that each MTU patient has only one tissue and one urine sample.
+
+```{r}
+# Extract MTU samples
+GSVA.result.cellmarker.mtu <- 
+  GSVA.result.cellmarker.all_sam %>% 
+  .[,colnames(.) %in% mtu.sample$SampleID.readable]
+
+# Generate a new data frame for replicate-free enrichment matrix
+for (.n.sample in 1:ncol(GSVA.result.cellmarker.mtu))
+{
+  ## check if the current sample is a replicate
+  .sample.id <- 
+    colnames(GSVA.result.cellmarker.mtu)[.n.sample]
+  .patient.id <-
+    sample.info$PatientID[
+      match(.sample.id,
+            sample.info$SampleID.readable)]
+  .sample.type <-
+    sample.info$SampleType[
+      match(.sample.id,
+            sample.info$SampleID.readable)]
+  .rep.all.info <-
+    sample.info %>%
+    dplyr::filter(SampleType == .sample.type &
+                    PatientID == .patient.id)
+  
+  ## Check and average the replicates.
+  ## Integrate the sample into a new dataset.
+  if (.n.sample == 1 & nrow(.rep.all.info) == 1)
+  {
+    GSVA.result.cellmarker.rep_comb <- 
+      data.frame(
+        GSVA.result.cellmarker.mtu[
+          .rep.all.info$SampleID.readable])
+  }
+  else if (.n.sample == 1 & nrow(.rep.all.info) > 1)
+  {
+    GSVA.result.cellmarker.rep_comb <- 
+      data.frame(
+        GSVA.result.cellmarker.mtu[
+          .rep.all.info$SampleID.readable] %>%
+          apply(X = .,MARGIN = 1,FUN = mean))
+  }
+  else if (.n.sample > 1 & nrow(.rep.all.info) == 1)
+    {
+    GSVA.result.cellmarker.rep_comb %<>%
+      cbind(
+        GSVA.result.cellmarker.mtu[
+          .rep.all.info$SampleID.readable])
+    }
+  else if (.n.sample > 1 & nrow(.rep.all.info) > 1)
+    {
+    if (.patient.id != .last.sample["patient.id"] |
+        .sample.type != .last.sample["sample.type"])
+      {
+      GSVA.result.cellmarker.rep_comb %<>% 
+        cbind(
+          GSVA.result.cellmarker.mtu[
+            .rep.all.info$SampleID.readable] %>%
+            apply(X = .,MARGIN = 1,FUN = mean))
+    }}
+  
+  ## Rename the new column by "patient ID + sample type"
+  colnames(GSVA.result.cellmarker.rep_comb)[
+    ncol(GSVA.result.cellmarker.rep_comb)] <-
+    .rep.all.info$ID_type[1]
+  
+  ## Save the current sample type and patient ID. If the next
+  ## sample is a replicate, we will skip it.
+  .last.sample <- 
+    c("patient.id" = .patient.id,
+      "sample.type" = .sample.type)
+}
+
+# Generate a long version
+GSVA.result.cellmarker.rep_comb.long <- 
+  GSVA.result.cellmarker.rep_comb %>% 
+  t %>% 
+  data.frame(check.names = F) %>% 
+  ## Add sample ID, type annotations, and patient ID
+  dplyr::mutate(
+    sample.id = rownames(.)) %>% 
+  dplyr::mutate(
+    sample.type = 
+      case_when(
+        str_detect(.$sample.id,"T") ~ "tissue",
+        str_detect(.$sample.id,"U") ~ "urine"),
+    patient.id =
+      str_extract(.$sample.id,"Q-\\d+")) %>% 
+  # Change to a long version
+  reshape2::melt(
+    id.vars = c("sample.id","sample.type","patient.id"),
+    variable.name = "cell.type",
+    value.name = "enrichment.score") %>% 
+  # Compare the enrichment scores in tissue vs urine and 
+  # add a column to record the result. For the convenience 
+  # of processing, jaxtapose the enrichment scores in
+  # tissue and urine first.
+  reshape2::dcast(
+    patient.id + cell.type ~ sample.type,
+    value.var = "enrichment.score") %>% 
+  # Add a result column
+  dplyr::mutate(
+    tissue.vs.urine = 
+      if_else(tissue > urine,
+              "higher in tissue",
+              "higher in urine")) %>% 
+  # Change the data again to the long version
+  reshape2::melt(
+    id.vars = c("patient.id","cell.type","tissue.vs.urine"),
+    measure.vars = c("tissue","urine"),
+    variable.name = "sample.type",
+    value.name = "enrichment.score")
+
+rm(.n.sample,.sample.id,.patient.id,.sample.type,
+   .rep.all.info,.last.sample)
+```
+
+## Statistical tests
+
+### Normality test
+
+All samples
+
+```{r}
+GSVA.stat_norm.cellmarker.all_sam <- 
+  GSVA.result.cellmarker.all_sam.long %>% 
+  group_by(sample.type,cell.type) %>% 
+  shapiro_test(vars = "enrichment.score")
+
+table(GSVA.stat_norm.cellmarker.all_sam$p > 0.05)
+```
+
+MTU samples
+
+```{r}
+GSVA.stat_norm.cellmarker.rep_comb <- 
+  GSVA.result.cellmarker.rep_comb.long %>% 
+  group_by(sample.type,cell.type) %>% 
+  shapiro_test(vars = "enrichment.score")
+
+table(GSVA.stat_norm.cellmarker.rep_comb$p > 0.05)
+```
+
+There are some groups of data that are not normally distributed. Perform non-parametric tests.
+
+### Wilcoxon test
+
+All samples
+
+```{r}
+GSVA.stat.cellmarker.all_sam.t_vs_u <- 
+  GSVA.result.cellmarker.all_sam.long %>%
+  group_by(cell.type) %>% 
+  rstatix::wilcox_test(
+    enrichment.score ~ sample.type) %>% 
+  adjust_pvalue(
+    method = "BH",
+    output.col = "p.adj") %>% 
+  add_significance()
+```
+
+MTU samples
+
+```{r}
+GSVA.stat.cellmarker.rep_comb.t_vs_u <- 
+  GSVA.result.cellmarker.rep_comb.long %>%
+  group_by(cell.type) %>% 
+  rstatix::wilcox_test(
+    enrichment.score ~ sample.type,
+    paired = T) %>% 
+  adjust_pvalue(
+    method = "BH",
+    output.col = "p.adj") %>% 
+  add_significance()
+```
+
+### Extract significant gene sets
+
+```{r}
+# statistical data
+GSVA.stat.cellmarker.all_sam.t_u_diff <- 
+  GSVA.stat.cellmarker.all_sam.t_vs_u %>% 
+  dplyr::filter(
+    p.adj < 0.05) %>% 
+  ## Add and adjust y coordinates
+  add_y_position() %>%
+  dplyr::mutate(
+    y.position = y.position + 0.1) %>% 
+  ## Add x coordinates
+  dplyr::mutate(
+    x = seq(1,nrow(.),1),
+    xmin = x - 0.2,
+    xmax = x + 0.2)
+
+GSVA.stat.cellmarker.rep_comb.t_u_diff <- 
+  GSVA.stat.cellmarker.rep_comb.t_vs_u %>% 
+  dplyr::filter(
+    p.adj < 0.05) %>% 
+  ## Add and adjust y coordinates
+  add_y_position() %>% 
+  dplyr::mutate(
+    y.position = y.position + 0.15) %>% 
+  ## Add x coordinates
+  dplyr::mutate(
+    x = seq(1,nrow(.),1),
+    xmin = x - 0.2,
+    xmax = x + 0.2)
+
+# Long expression data
+GSVA.result.cellmarker.t_u_diff.all_sam.long <- 
+  GSVA.result.cellmarker.all_sam.long %>% 
+  dplyr::filter(
+    cell.type %in% 
+      GSVA.stat.cellmarker.all_sam.t_u_diff$cell.type)
+
+GSVA.result.cellmarker.t_u_diff.rep_comb.long <- 
+  GSVA.result.cellmarker.rep_comb.long %>% 
+  dplyr::filter(
+    cell.type %in% 
+      GSVA.stat.cellmarker.rep_comb.t_u_diff$cell.type) %>% 
+  # Add x ordinates for ggplot
+  dplyr::mutate(
+    geom.line.x =
+      case_when(
+        cell.type == "Blood_Peripheral blood_Fibroblast" &
+          sample.type == "tissue" ~ 0.8,
+        cell.type == "Blood_Peripheral blood_Fibroblast" &
+          sample.type == "urine" ~ 1.2,
+        cell.type == 
+          "Blood_Peripheral blood_Regulatory T (Treg) cell" &
+          sample.type == "tissue" ~ 1.8,
+        cell.type == 
+          "Blood_Peripheral blood_Regulatory T (Treg) cell" &
+          sample.type == "urine" ~ 2.2,
+        cell.type == "Prostate_Prostate_Basal cell" &
+          sample.type == "tissue" ~ 2.8,
+        cell.type == "Prostate_Prostate_Basal cell" &
+          sample.type == "urine" ~ 3.2))
+```
+
+```{r}
+GSVA.stat.cellmarker.all_sam.t_u_diff$cell.type
+```
+
+```{r}
+GSVA.stat.cellmarker.rep_comb.t_u_diff$cell.type
+```
+
+There are three gene sets with significant differences between tissue and urine samples.
+
+## Visualization
+
+All samples
+
+```{r fig.height=6, fig.width=8}
+ggplot(
+  data = GSVA.result.cellmarker.t_u_diff.all_sam.long,
+  mapping = aes(
+    x = cell.type,y = enrichment.score,
+    fill = sample.type)) +
+  stat_summary(
+    fun.min = function(x){quantile(x)["75%"]+1.5*sd(x)},
+    fun.max = function(x){quantile(x)["25%"]-1.5*sd(x)},
+    geom = "errorbar",
+    position = position_dodge(width = 0.8),
+    width = 0.4,color = "black",linewidth = 0.5) +
+  geom_boxplot(
+    position = position_dodge(0.8),
+    coef = 0,
+    outlier.shape = NA) +
+  scale_fill_manual(
+    labels = c(
+      paste0("tissue\n(n=",
+             GSVA.stat.cellmarker.all_sam.t_vs_u$n1[1],")"),
+      paste0("urine\n(n=",
+             GSVA.stat.cellmarker.all_sam.t_vs_u$n2[1],")")),
+    values = c("darkmagenta","yellow3")) +
+  xlab(NULL) +
+  ylab(NULL) +
+  scale_x_discrete(
+    labels = c("vascular\nendothelial cell",
+               "blood\nfibroblast",
+               "blood\nTreg cell",
+               "prostate\nbasal cell")) +
+  ggtitle("enrichment scores of cell marker genes\nin all samples\ntissue vs urine") +
+  stat_pvalue_manual(
+    GSVA.stat.cellmarker.all_sam.t_u_diff,
+    label = "p.adj.signif",
+    tip.length = 0.01,label.size = 7) +
+  theme(
+    axis.line = element_line(),
+    panel.background = element_blank(),
+    plot.title = element_text(
+      size = 20,face = "bold",hjust = 0),
+    axis.text.x = element_text(
+      size = 20,hjust = 0.5),
+    axis.text.y = element_text(
+      size = 20),
+    legend.title = element_blank(),,
+    legend.key = element_rect(
+      fill = "white",color = "white"),
+    legend.key.height = unit(1,"cm"),
+    legend.key.width = unit(0.5,"cm"),
+    legend.text = element_text(size = 20))
+```
+
+MTU samples
+
+```{r}
+ggplot(
+  data = GSVA.result.cellmarker.t_u_diff.rep_comb.long,
+  mapping = aes(
+    x = cell.type,y = enrichment.score,
+    fill = sample.type)) +
+  stat_summary(
+    fun.min = function(x){quantile(x)["75%"]+1.5*sd(x)},
+    fun.max = function(x){quantile(x)["25%"]-1.5*sd(x)},
+    geom = "errorbar",
+    position = position_dodge(width = 0.8),
+    width = 0.4,color = "black",linewidth = 0.5) +
+  geom_boxplot(
+    position = position_dodge(0.8),
+    coef = 0,
+    outlier.shape = NA) +
+  scale_fill_manual(
+    labels = c(
+      paste0("tissue\n(n=",
+             GSVA.stat.cellmarker.rep_comb.t_vs_u$n1[1],")"),
+      paste0("urine\n(n=",
+             GSVA.stat.cellmarker.rep_comb.t_vs_u$n2[1],")")),
+    values = c("darkmagenta","yellow3")) +
+  geom_point(
+    position = position_dodge(0.8)) +
+  geom_line(
+    data = 
+      GSVA.result.cellmarker.t_u_diff.rep_comb.long %>% 
+      dplyr::filter(
+        cell.type == 
+          "Blood_Peripheral blood_Fibroblast"),
+    mapping = aes(
+      x = geom.line.x,y = enrichment.score,
+      group = patient.id,color = tissue.vs.urine)) +
+  geom_line(
+    data = 
+      GSVA.result.cellmarker.t_u_diff.rep_comb.long %>% 
+      dplyr::filter(
+        cell.type == 
+          "Blood_Peripheral blood_Regulatory T (Treg) cell"),
+    mapping = aes(
+      x = geom.line.x,y = enrichment.score,
+      group = patient.id,color = tissue.vs.urine)) +
+  geom_line(
+    data = 
+      GSVA.result.cellmarker.t_u_diff.rep_comb.long %>% 
+      dplyr::filter(
+        cell.type == 
+          "Prostate_Prostate_Basal cell"),
+    mapping = aes(
+      x = geom.line.x,y = enrichment.score,
+      group = patient.id,color = tissue.vs.urine)) +
+  scale_color_manual(
+    labels = c("higher in tissue",
+               "higher in urine"),
+    values = c("dodgerblue","sienna")) +
+  xlab(NULL) +
+  ylab(NULL) +
+  ggtitle("enrichment scores of cell marker genes\nin MTU samples\ntissue vs urine") +
+  scale_x_discrete(
+    labels = c("blood\nfibroblast",
+               "blood\nTreg cell",
+               "prostate\nbasal cell")) +
+  stat_pvalue_manual(
+    GSVA.stat.cellmarker.rep_comb.t_u_diff,
+    label = "p.adj.signif",
+    tip.length = 0.01,label.size = 7) +
+  theme(
+    axis.line = element_line(),
+    panel.background = element_blank(),
+    plot.title = element_text(
+      size = 20,face = "bold",hjust = 0),
+    axis.text.x = element_text(
+      size = 20,hjust = 0.5),
+    axis.text.y = element_text(
+      size = 20),
+    legend.title = element_blank(),,
+    legend.key = element_rect(
+      fill = "white",color = "white"),
+    legend.key.height = unit(1,"cm"),
+    legend.key.width = unit(0.5,"cm"),
+    legend.text = element_text(size = 20))
+```
+
+## Summary
+
+In either all samples or MTU samples, three types of cell markers were significantly enriched in urine compared to tissue:
